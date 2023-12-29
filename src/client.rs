@@ -7,7 +7,6 @@ use hyper_alpn::AlpnConnector;
 
 use crate::request::payload::Payload;
 use crate::response::Response;
-use http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::{self, Body, Client as HttpClient, StatusCode};
 use std::fmt;
 use std::io::Read;
@@ -146,7 +145,7 @@ impl Client {
         let mut builder = hyper::Request::builder()
             .uri(&path)
             .method("POST")
-            .header(CONTENT_TYPE, "application/json");
+            .header(hyper::header::CONTENT_TYPE, "application/json");
 
         if let Some(ref apns_priority) = payload.options.apns_priority {
             builder = builder.header("apns-priority", apns_priority.to_string().as_bytes());
@@ -168,11 +167,14 @@ impl Client {
                 .with_signature(|signature| format!("Bearer {}", signature))
                 .unwrap();
 
-            builder = builder.header(AUTHORIZATION, auth.as_bytes());
+            builder = builder.header(hyper::header::AUTHORIZATION, auth.as_bytes());
         }
 
         let payload_json = payload.to_json_string().unwrap();
-        builder = builder.header(CONTENT_LENGTH, format!("{}", payload_json.len()).as_bytes());
+        builder = builder.header(
+            hyper::header::CONTENT_LENGTH,
+            format!("{}", payload_json.len()).as_bytes(),
+        );
 
         let request_body = Body::from(payload_json);
         builder.body(request_body).unwrap()
@@ -186,7 +188,6 @@ mod tests {
     use crate::request::notification::NotificationBuilder;
     use crate::request::notification::{CollapseId, NotificationOptions, Priority};
     use crate::signer::Signer;
-    use http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
     use hyper::Method;
     use hyper_alpn::AlpnConnector;
 
@@ -235,7 +236,10 @@ jDwmlD1Gg0yJt1e38djFwsxsfr5q2hv0Rj9fTEqAPr8H7mGm0wKxZ7iQ
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
 
-        assert_eq!("application/json", request.headers().get(CONTENT_TYPE).unwrap());
+        assert_eq!(
+            "application/json",
+            request.headers().get(hyper::header::CONTENT_TYPE).unwrap()
+        );
     }
 
     #[test]
@@ -245,7 +249,12 @@ jDwmlD1Gg0yJt1e38djFwsxsfr5q2hv0Rj9fTEqAPr8H7mGm0wKxZ7iQ
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload.clone());
         let payload_json = payload.to_json_string().unwrap();
-        let content_length = request.headers().get(CONTENT_LENGTH).unwrap().to_str().unwrap();
+        let content_length = request
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .unwrap()
+            .to_str()
+            .unwrap();
 
         assert_eq!(&format!("{}", payload_json.len()), content_length);
     }
@@ -257,7 +266,7 @@ jDwmlD1Gg0yJt1e38djFwsxsfr5q2hv0Rj9fTEqAPr8H7mGm0wKxZ7iQ
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
 
-        assert_eq!(None, request.headers().get(AUTHORIZATION));
+        assert_eq!(None, request.headers().get(hyper::header::AUTHORIZATION));
     }
 
     #[test]
@@ -275,7 +284,7 @@ jDwmlD1Gg0yJt1e38djFwsxsfr5q2hv0Rj9fTEqAPr8H7mGm0wKxZ7iQ
         let client = Client::new(AlpnConnector::new(), Some(signer), Endpoint::Production);
         let request = client.build_request(payload);
 
-        assert_ne!(None, request.headers().get(AUTHORIZATION));
+        assert_ne!(None, request.headers().get(hyper::header::AUTHORIZATION));
     }
 
     #[test]
