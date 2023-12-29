@@ -1,23 +1,19 @@
 # a2
 
-[![Travis Build Status](https://travis-ci.org/pimeys/a2.svg?branch=master)](https://travis-ci.org/pimeys/a2)
+[![CI Status](https://github.com/walletconnect/a2/actions/workflows/ci.yml/badge.svg)](https://github.com/walletconnect/a2/actions/workflows/ci.yml)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![crates.io](http://meritbadge.herokuapp.com/a2)](https://crates.io/crates/a2)
+[![crates.io](https://img.shields.io/crates/v/a2)](https://crates.io/crates/a2)
 
 HTTP/2 Apple Push Notification Service for Rust using Tokio and async sending.
 
-## Help needed
-
-The main author is not currently owning any Apple phones, so would be nice to have some help from a co-author with needed devices and an Apple developer account. If you happen to have them and are willing to help, please contact!
-
 ## Requirements
 
-Needs a Tokio executor version 0.2 or later and Rust compiler version 1.39.0 or later.
+Needs a Tokio executor version 1.0 or later and Rust compiler version 1.60.0 or later.
 
 ## Documentation
 
 * [Released](https://docs.rs/a2/)
-* [Master](https://pimeys.github.io/a2/master/)
+* [Master](https://walletconnect.github.io/a2/master/)
 
 ## Features
 
@@ -31,20 +27,22 @@ Needs a Tokio executor version 0.2 or later and Rust compiler version 1.39.0 or 
 * Supports `.p8` private keys to connect using authentication tokens.
 * If using authentication tokens, handles signature renewing for Apple's guidelines
   and caching for maximum performance.
+* Cryptography primitives are provided either by openssl or
+  [ring](https://github.com/briansmith/ring).
 
 ## Examples
 
 The library supports connecting to Apple Push Notification service [either using
 a
-certificate](https://github.com/pimeys/a2/blob/master/examples/certificate_client.rs)
+certificate](https://github.com/walletconnect/a2/blob/master/examples/certificate_client.rs)
 with a password [or a private
-key](https://github.com/pimeys/a2/blob/master/examples/token_client.rs) with
+key](https://github.com/walletconnect/a2/blob/master/examples/token_client.rs) with
 a team id and key id. Both are available from your Apple account and with both
 it is possible to send push notifications to one application.
 
-To see it used in a real project, take a look to the [XORC
-Notifications](https://github.com/xray-tech/xorc-notifications), which is a
-full-fledged consumer for sending push notifications.
+To see it used in a real project, take a look to the [Echo
+Server](https://github.com/walletconnect/echo-server), which is a project by WalletConnect to
+handle incoming webhooks and converting them to push notifications.
 
 ## Gotchas
 
@@ -68,7 +66,3 @@ for production use:
 ## Tests
 
 `cargo test`
-
-## Contact
-
-oh_lawd @ IRC (Freenode, Mozilla)

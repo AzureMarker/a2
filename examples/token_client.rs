@@ -1,20 +1,12 @@
-use tokio;
-use pretty_env_logger;
 use argparse::{ArgumentParser, Store, StoreOption, StoreTrue};
 use std::fs::File;
 
-use a2::{
-    Client,
-    Endpoint,
-    NotificationBuilder,
-    NotificationOptions,
-    PlainNotificationBuilder,
-};
+use a2::{Client, DefaultNotificationBuilder, Endpoint, NotificationBuilder, NotificationOptions};
 
 // An example client connectiong to APNs with a JWT token
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    pretty_env_logger::init();
+    tracing_subscriber::fmt().init();
 
     let mut key_file = String::new();
     let mut team_id = String::new();
@@ -33,18 +25,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .add_option(&["-t", "--team_id"], Store, "APNs team ID");
         ap.refer(&mut key_id)
             .add_option(&["-k", "--key_id"], Store, "APNs key ID");
-        ap.refer(&mut device_token).add_option(
-            &["-d", "--device_token"],
-            Store,
-            "APNs device token",
-        );
+        ap.refer(&mut device_token)
+            .add_option(&["-d", "--device_token"], Store, "APNs device token");
         ap.refer(&mut message)
             .add_option(&["-m", "--message"], Store, "Notification message");
-        ap.refer(&mut sandbox).add_option(
-            &["-s", "--sandbox"],
-            StoreTrue,
-            "Use the development APNs servers",
-        );
+        ap.refer(&mut sandbox)
+            .add_option(&["-s", "--sandbox"], StoreTrue, "Use the development APNs servers");
         ap.refer(&mut topic)
             .add_option(&["-o", "--topic"], StoreOption, "APNS topic");
         ap.parse_args_or_exit();
@@ -64,14 +50,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::token(&mut private_key, key_id, team_id, endpoint).unwrap();
 
     let options = NotificationOptions {
-        apns_topic: topic.as_ref().map(|s| &**s),
+        apns_topic: topic.as_deref(),
         ..Default::default()
     };
 
     // Notification payload
-    let mut builder = PlainNotificationBuilder::new(message.as_ref());
-    builder.set_sound("default");
-    builder.set_badge(1u32);
+    let builder = DefaultNotificationBuilder::new()
+        .set_body(message.as_ref())
+        .set_sound("default")
+        .set_badge(1u32);
 
     let payload = builder.build(device_token.as_ref(), options);
     let response = client.send(payload).await?;

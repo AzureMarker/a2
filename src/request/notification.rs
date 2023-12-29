@@ -1,14 +1,11 @@
-//! The `aps` notification content builders
-
-mod localized;
-mod plain;
-mod silent;
+/// The `aps` notification content builders
+mod default;
 mod options;
+mod web;
 
-pub use self::localized::{LocalizedAlert, LocalizedNotificationBuilder};
-pub use self::plain::PlainNotificationBuilder;
-pub use self::silent::SilentNotificationBuilder;
+pub use self::default::{DefaultAlert, DefaultNotificationBuilder};
 pub use self::options::{CollapseId, NotificationOptions, Priority};
+pub use self::web::{WebNotificationBuilder, WebPushAlert};
 
 use crate::request::payload::Payload;
 

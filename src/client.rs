@@ -1,26 +1,16 @@
 //! The client module for sending requests and parsing responses
 
-use crate::signer::Signer;
-use hyper_alpn::AlpnConnector;
 use crate::error::Error;
 use crate::error::Error::ResponseError;
+use crate::signer::Signer;
+use hyper_alpn::AlpnConnector;
 
-use futures::stream::StreamExt;
-use hyper::{
-    self,
-    Client as HttpClient,
-    StatusCode,
-    Body
-};
-use http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use crate::request::payload::Payload;
 use crate::response::Response;
-use serde_json;
-use std::{fmt, str};
-use std::time::Duration;
-use std::future::Future;
-use openssl::pkcs12::Pkcs12;
+use hyper::{self, Body, Client as HttpClient, StatusCode};
+use std::fmt;
 use std::io::Read;
+use std::time::Duration;
 
 /// The APNs service endpoint to connect.
 #[derive(Debug, Clone)]
@@ -50,6 +40,7 @@ impl fmt::Display for Endpoint {
 /// the notification and responds with a status OK. In any other case the future
 /// fails. If APNs gives a reason for the failure, the returned `Err`
 /// holds the response for handling.
+#[derive(Debug, Clone)]
 pub struct Client {
     endpoint: Endpoint,
     signer: Option<Signer>,
@@ -57,11 +48,7 @@ pub struct Client {
 }
 
 impl Client {
-    fn new(
-        connector: AlpnConnector,
-        signer: Option<Signer>,
-        endpoint: Endpoint,
-    ) -> Client {
+    fn new(connector: AlpnConnector, signer: Option<Signer>, endpoint: Endpoint) -> Client {
         let mut builder = HttpClient::builder();
         builder.pool_idle_timeout(Some(Duration::from_secs(600)));
         builder.http2_only(true);
@@ -76,22 +63,27 @@ impl Client {
     /// Create a connection to APNs using the provider client certificate which
     /// you obtain from your [Apple developer
     /// account](https://developer.apple.com/account/).
-    pub fn certificate<R>(
-        certificate: &mut R,
-        password: &str,
-        endpoint: Endpoint,
-    ) -> Result<Client, Error>
+    ///
+    /// Only works with the `openssl` feature.
+    #[cfg(feature = "openssl")]
+    pub fn certificate<R>(certificate: &mut R, password: &str, endpoint: Endpoint) -> Result<Client, Error>
     where
         R: Read,
     {
         let mut cert_der: Vec<u8> = Vec::new();
         certificate.read_to_end(&mut cert_der)?;
 
-        let pkcs = Pkcs12::from_der(&cert_der)?.parse(password)?;
-        let connector = AlpnConnector::with_client_cert(
-            &pkcs.cert.to_pem()?,
-            &pkcs.pkey.private_key_to_pem_pkcs8()?,
-        )?;
+        let pkcs = openssl::pkcs12::Pkcs12::from_der(&cert_der)?.parse(password)?;
+        let connector = AlpnConnector::with_client_cert(&pkcs.cert.to_pem()?, &pkcs.pkey.private_key_to_pem_pkcs8()?)?;
+
+        Ok(Self::new(connector, None, endpoint))
+    }
+
+    /// Create a connection to APNs using the raw PEM-formatted certificate and
+    /// key, extracted from the provider client certificate you obtain from your
+    /// [Apple developer account](https://developer.apple.com/account/)
+    pub fn certificate_parts(cert_pem: &[u8], key_pem: &[u8], endpoint: Endpoint) -> Result<Client, Error> {
+        let connector = AlpnConnector::with_client_cert(cert_pem, key_pem)?;
 
         Ok(Self::new(connector, None, endpoint))
     }
@@ -100,12 +92,7 @@ impl Client {
     /// request with a signature using a private key, key id and team id
     /// provisioned from your [Apple developer
     /// account](https://developer.apple.com/account/).
-    pub fn token<S, T, R>(
-        pkcs8_pem: R,
-        key_id: S,
-        team_id: T,
-        endpoint: Endpoint,
-    ) -> Result<Client, Error>
+    pub fn token<S, T, R>(pkcs8_pem: R, key_id: S, team_id: T, endpoint: Endpoint) -> Result<Client, Error>
     where
         S: Into<String>,
         T: Into<String>,
@@ -121,88 +108,73 @@ impl Client {
     /// Send a notification payload.
     ///
     /// See [ErrorReason](enum.ErrorReason.html) for possible errors.
-    pub fn send(&self, payload: Payload<'_>) -> impl Future<Output = Result<Response, Error>> + 'static {
+    #[cfg_attr(feature = "tracing", ::tracing::instrument)]
+    pub async fn send(&self, payload: Payload<'_>) -> Result<Response, Error> {
         let request = self.build_request(payload);
         let requesting = self.http_client.request(request);
 
-        async move {
-            let response = requesting.await?;
+        let response = requesting.await?;
 
-            let apns_id = response
-                .headers()
-                .get("apns-id")
-                .and_then(|s| s.to_str().ok())
-                .map(|id| String::from(id));
+        let apns_id = response
+            .headers()
+            .get("apns-id")
+            .and_then(|s| s.to_str().ok())
+            .map(String::from);
 
-            match response.status() {
-                StatusCode::OK => {
-                    Ok(Response {
-                        apns_id,
-                        error: None,
-                        code: response.status().as_u16(),
-                    })
-                },
-                status => {
-                    let content_length: usize = response
-                        .headers()
-                        .get(CONTENT_LENGTH)
-                        .and_then(|s| s.to_str().ok())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
+        match response.status() {
+            StatusCode::OK => Ok(Response {
+                apns_id,
+                error: None,
+                code: response.status().as_u16(),
+            }),
+            status => {
+                let body = hyper::body::to_bytes(response).await?;
 
-                    let mut body: Vec<u8> = Vec::with_capacity(content_length);
-                    let mut chunks = response.into_body();
-
-                    while let Some(chunk) = chunks.next().await {
-                        body.extend_from_slice(&chunk?);
-                    }
-
-                    Err(ResponseError(Response {
-                        apns_id,
-                        error: serde_json::from_slice(&body).ok(),
-                        code: status.as_u16(),
-                    }))
-                }
+                Err(ResponseError(Response {
+                    apns_id,
+                    error: serde_json::from_slice(&body).ok(),
+                    code: status.as_u16(),
+                }))
             }
         }
     }
 
     fn build_request(&self, payload: Payload<'_>) -> hyper::Request<Body> {
-        let path = format!(
-            "https://{}/3/device/{}",
-            self.endpoint, payload.device_token
-        );
+        let path = format!("https://{}/3/device/{}", self.endpoint, payload.device_token);
 
         let mut builder = hyper::Request::builder()
             .uri(&path)
             .method("POST")
-            .header(CONTENT_TYPE, "application/json");
+            .header(hyper::header::CONTENT_TYPE, "application/json");
 
         if let Some(ref apns_priority) = payload.options.apns_priority {
-            builder = builder.header("apns-priority", format!("{}", apns_priority).as_bytes());
+            builder = builder.header("apns-priority", apns_priority.to_string().as_bytes());
         }
-        if let Some(ref apns_id) = payload.options.apns_id {
+        if let Some(apns_id) = payload.options.apns_id {
             builder = builder.header("apns-id", apns_id.as_bytes());
         }
         if let Some(ref apns_expiration) = payload.options.apns_expiration {
-            builder = builder.header("apns-expiration", format!("{}", apns_expiration).as_bytes());
+            builder = builder.header("apns-expiration", apns_expiration.to_string().as_bytes());
         }
         if let Some(ref apns_collapse_id) = payload.options.apns_collapse_id {
-            builder = builder.header("apns-collapse-id", format!("{}", apns_collapse_id.value).as_bytes());
+            builder = builder.header("apns-collapse-id", apns_collapse_id.value.as_bytes());
         }
-        if let Some(ref apns_topic) = payload.options.apns_topic {
+        if let Some(apns_topic) = payload.options.apns_topic {
             builder = builder.header("apns-topic", apns_topic.as_bytes());
         }
         if let Some(ref signer) = self.signer {
-            let auth = signer.with_signature(|signature| {
-                format!("Bearer {}", signature)
-            }).unwrap();
+            let auth = signer
+                .with_signature(|signature| format!("Bearer {}", signature))
+                .unwrap();
 
-            builder = builder.header(AUTHORIZATION, auth.as_bytes());
+            builder = builder.header(hyper::header::AUTHORIZATION, auth.as_bytes());
         }
 
         let payload_json = payload.to_json_string().unwrap();
-        builder = builder.header(CONTENT_LENGTH, format!("{}", payload_json.len()).as_bytes());
+        builder = builder.header(
+            hyper::header::CONTENT_LENGTH,
+            format!("{}", payload_json.len()).as_bytes(),
+        );
 
         let request_body = Body::from(payload_json);
         builder.body(request_body).unwrap()
@@ -212,25 +184,22 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::notification::PlainNotificationBuilder;
+    use crate::request::notification::DefaultNotificationBuilder;
     use crate::request::notification::NotificationBuilder;
-    use crate::request::notification::{NotificationOptions, Priority, CollapseId};
-    use hyper_alpn::AlpnConnector;
-    use hyper::Method;
-    use http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+    use crate::request::notification::{CollapseId, NotificationOptions, Priority};
     use crate::signer::Signer;
+    use hyper::Method;
+    use hyper_alpn::AlpnConnector;
 
-    const PRIVATE_KEY: &'static str = indoc!(
-        "-----BEGIN PRIVATE KEY-----
-        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg8g/n6j9roKvnUkwu
-        lCEIvbDqlUhA5FOzcakkG90E8L+hRANCAATKS2ZExEybUvchRDuKBftotMwVEus3
-        jDwmlD1Gg0yJt1e38djFwsxsfr5q2hv0Rj9fTEqAPr8H7mGm0wKxZ7iQ
-        -----END PRIVATE KEY-----"
-    );
+    const PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg8g/n6j9roKvnUkwu
+lCEIvbDqlUhA5FOzcakkG90E8L+hRANCAATKS2ZExEybUvchRDuKBftotMwVEus3
+jDwmlD1Gg0yJt1e38djFwsxsfr5q2hv0Rj9fTEqAPr8H7mGm0wKxZ7iQ
+-----END PRIVATE KEY-----";
 
     #[test]
     fn test_production_request_uri() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
         let payload = builder.build("a_test_id", Default::default());
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
@@ -241,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_sandbox_request_uri() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
         let payload = builder.build("a_test_id", Default::default());
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Sandbox);
         let request = client.build_request(payload);
@@ -252,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_request_method() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
         let payload = builder.build("a_test_id", Default::default());
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
@@ -262,54 +231,65 @@ mod tests {
 
     #[test]
     fn test_request_content_type() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
         let payload = builder.build("a_test_id", Default::default());
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
 
-        assert_eq!("application/json", request.headers().get(CONTENT_TYPE).unwrap());
-    }
-
-    #[test]
-    fn test_request_content_length() {
-        let builder = PlainNotificationBuilder::new("test");
-        let payload = builder.build("a_test_id", Default::default());
-        let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
-        let request = client.build_request(payload.clone());
-        let payload_json = payload.to_json_string().unwrap();
-        let content_length = request.headers().get(CONTENT_LENGTH).unwrap().to_str().unwrap();
-
         assert_eq!(
-            &format!("{}", payload_json.len()),
-            content_length
+            "application/json",
+            request.headers().get(hyper::header::CONTENT_TYPE).unwrap()
         );
     }
 
     #[test]
+    fn test_request_content_length() {
+        let builder = DefaultNotificationBuilder::new();
+        let payload = builder.build("a_test_id", Default::default());
+        let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
+        let request = client.build_request(payload.clone());
+        let payload_json = payload.to_json_string().unwrap();
+        let content_length = request
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .unwrap()
+            .to_str()
+            .unwrap();
+
+        assert_eq!(&format!("{}", payload_json.len()), content_length);
+    }
+
+    #[test]
     fn test_request_authorization_with_no_signer() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
         let payload = builder.build("a_test_id", Default::default());
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
 
-        assert_eq!(None, request.headers().get(AUTHORIZATION));
+        assert_eq!(None, request.headers().get(hyper::header::AUTHORIZATION));
     }
 
     #[test]
     fn test_request_authorization_with_a_signer() {
-        let signer = Signer::new(PRIVATE_KEY.as_bytes(), "89AFRD1X22", "ASDFQWERTY", Duration::from_secs(100)).unwrap();
+        let signer = Signer::new(
+            PRIVATE_KEY.as_bytes(),
+            "89AFRD1X22",
+            "ASDFQWERTY",
+            Duration::from_secs(100),
+        )
+        .unwrap();
 
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
         let payload = builder.build("a_test_id", Default::default());
         let client = Client::new(AlpnConnector::new(), Some(signer), Endpoint::Production);
         let request = client.build_request(payload);
 
-        assert_ne!(None, request.headers().get(AUTHORIZATION));
+        assert_ne!(None, request.headers().get(hyper::header::AUTHORIZATION));
     }
 
     #[test]
     fn test_request_with_default_priority() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
         let payload = builder.build("a_test_id", Default::default());
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
@@ -320,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_request_with_normal_priority() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
         let payload = builder.build(
             "a_test_id",
@@ -339,14 +319,14 @@ mod tests {
 
     #[test]
     fn test_request_with_high_priority() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
         let payload = builder.build(
             "a_test_id",
             NotificationOptions {
                 apns_priority: Some(Priority::High),
                 ..Default::default()
-            }
+            },
         );
 
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
@@ -358,12 +338,9 @@ mod tests {
 
     #[test]
     fn test_request_with_default_apns_id() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
-        let payload = builder.build(
-            "a_test_id",
-            Default::default(),
-        );
+        let payload = builder.build("a_test_id", Default::default());
 
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
@@ -374,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_request_with_an_apns_id() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
         let payload = builder.build(
             "a_test_id",
@@ -393,12 +370,9 @@ mod tests {
 
     #[test]
     fn test_request_with_default_apns_expiration() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
-        let payload = builder.build(
-            "a_test_id",
-            Default::default(),
-        );
+        let payload = builder.build("a_test_id", Default::default());
 
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
@@ -409,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_request_with_an_apns_expiration() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
         let payload = builder.build(
             "a_test_id",
@@ -428,12 +402,9 @@ mod tests {
 
     #[test]
     fn test_request_with_default_apns_collapse_id() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
-        let payload = builder.build(
-            "a_test_id",
-            Default::default(),
-        );
+        let payload = builder.build("a_test_id", Default::default());
 
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
@@ -444,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_request_with_an_apns_collapse_id() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
         let payload = builder.build(
             "a_test_id",
@@ -463,12 +434,9 @@ mod tests {
 
     #[test]
     fn test_request_with_default_apns_topic() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
-        let payload = builder.build(
-            "a_test_id",
-            Default::default(),
-        );
+        let payload = builder.build("a_test_id", Default::default());
 
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload);
@@ -479,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_request_with_an_apns_topic() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
 
         let payload = builder.build(
             "a_test_id",
@@ -498,22 +466,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_body() {
-        let builder = PlainNotificationBuilder::new("test");
+        let builder = DefaultNotificationBuilder::new();
         let payload = builder.build("a_test_id", Default::default());
         let client = Client::new(AlpnConnector::new(), None, Endpoint::Production);
         let request = client.build_request(payload.clone());
 
-        let mut body: Vec<u8> = Vec::new();
-        let mut chunks = request.into_body();
+        let body = hyper::body::to_bytes(request).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
 
-        while let Some(chunk) = chunks.next().await {
-            body.extend_from_slice(&chunk.unwrap());
-        }
-        let body_str = String::from_utf8(body).unwrap();
+        assert_eq!(payload.to_json_string().unwrap(), body_str,);
+    }
 
-        assert_eq!(
-            payload.to_json_string().unwrap(),
-            body_str,
-        );
+    #[tokio::test]
+    /// Try to create a test client using the unencrypted key & cert provided.
+    /// These are test values that do not work with Apple, but mimic the sort
+    /// of values you should get from the Apple Developer Console.
+    async fn test_cert_parts() -> Result<(), Error> {
+        let key: Vec<u8> = include_str!("../test_cert/test.key").bytes().collect();
+        let cert: Vec<u8> = include_str!("../test_cert/test.crt").bytes().collect();
+
+        let c = Client::certificate_parts(&cert, &key, Endpoint::Sandbox)?;
+        assert!(c.signer.is_none());
+        Ok(())
     }
 }
